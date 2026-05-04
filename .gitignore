@@ -1,0 +1,34 @@
+# Dados gerados em runtime — NUNCA commitar
+data/
+received/
+uploads/
+
+# Sessoes e storage local de UI
+.nicegui/
+
+# Configuracao local do Claude Code (permissoes e segredos de maquina)
+.claude/settings.local.json
+
+# Python
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtualenvs
+myvenv/
+venv/
+.venv/
+env/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
