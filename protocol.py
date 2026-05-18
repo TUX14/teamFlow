@@ -2,24 +2,28 @@
 Protocolo de mensagens P2P do TeamFlow.
 
 Todos os payloads são dicts JSON. O campo 'type' identifica o tipo.
-A camada de transporte (peer_server/peer_client) cuida da criptografia — aqui
-só definimos a estrutura e o dispatcher.
+A camada de transporte (peer_server/peer_client) cuida da criptografia de sessão.
+Mensagens de grupo têm uma segunda camada de cifra com group_key (ChaCha20-Poly1305)
+aplicada em node.py antes de entrar nesta camada.
 
 Tipos:
   chat          — DM entre dois peers
-  group_msg     — mensagem de grupo (fan-out)
+  group_msg     — mensagem de grupo (fan-out); campo 'text' é hex cifrado com group_key
   group_state   — estado completo do grupo (sync de membros)
   invite        — convite para grupo
   join_request  — novo membro pedindo entrada após aceitar convite
   leave         — membro saindo de grupo
   dissolve      — admin apagando grupo
   ack           — confirmação de recebimento
+  ping/pong     — medição de latência
+  file_offer    — oferta de transferência de arquivo
+  file_chunk    — chunk de arquivo (base64)
+  file_accept   — receptor aceita a oferta
+  file_reject   — receptor recusa a oferta
 """
 
 import time
 import uuid
-from dataclasses import dataclass, field
-from typing import Callable, Any
 
 
 # ---------------------------------------------------------------------------
@@ -70,9 +74,6 @@ def make_leave(group_id: str, pub_key_hex: str) -> dict:
     return {"type": "leave", "group_id": group_id, "pub_key_hex": pub_key_hex}
 
 
-def make_dissolve(group_id: str) -> dict:
-    return {"type": "dissolve", "group_id": group_id}
-
 
 def make_ping(uid: str) -> dict:
     return {"type": "ping", "uuid": uid, "ts": time.time()}
@@ -110,31 +111,3 @@ def make_file_accept(file_id: str) -> dict:
 
 def make_file_reject(file_id: str) -> dict:
     return {"type": "file_reject", "file_id": file_id}
-
-
-# ---------------------------------------------------------------------------
-# Dispatcher — roteamento de mensagens recebidas
-# ---------------------------------------------------------------------------
-
-Handler = Callable[[dict, Any], None]  # (payload, session)
-
-
-class Dispatcher:
-    def __init__(self):
-        self._handlers: dict[str, list[Handler]] = {}
-
-    def register(self, msg_type: str, fn: Handler) -> None:
-        self._handlers.setdefault(msg_type, []).append(fn)
-
-    def dispatch(self, payload: dict, session: Any) -> None:
-        msg_type = payload.get("type", "")
-        for fn in self._handlers.get(msg_type, []):
-            try:
-                fn(payload, session)
-            except Exception:
-                pass
-        for fn in self._handlers.get("*", []):
-            try:
-                fn(payload, session)
-            except Exception:
-                pass

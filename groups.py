@@ -8,10 +8,12 @@ Ao remover membro: group_key é rotacionada (forward secrecy).
 Grupos sem membros são apagados do banco automaticamente.
 """
 
+import hashlib
 import json
 import os
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable
 
 from crypto import (
@@ -84,7 +86,6 @@ class GroupState:
 
     @property
     def member_hashes(self) -> set[str]:
-        import hashlib
         return {hashlib.sha256(bytes.fromhex(m.pub_key_hex)).hexdigest()[:32] for m in self.members}
 
 
@@ -95,9 +96,9 @@ def _sign_state(identity: LocalIdentity, state: GroupState) -> GroupState:
 
 
 class GroupManager:
-    def __init__(self, identity: LocalIdentity, db_path=None):
+    def __init__(self, identity: LocalIdentity, db_path: Path):
         self.identity = identity
-        self._db_path = db_path  # None = usa default do db.py
+        self._db_path = db_path
         self._groups: dict[str, GroupState] = {}
         self._on_update: list[Callable[[GroupState, str], None]] = []  # (state, event)
 
@@ -112,19 +113,16 @@ class GroupManager:
                 pass
 
     def load_from_db(self) -> None:
-        kw = {"path": self._db_path} if self._db_path else {}
-        for d in load_all_groups(self.identity.db_key, **kw):
+        for d in load_all_groups(self.identity.db_key, self._db_path):
             state = GroupState.from_dict(d)
             self._groups[state.group_id] = state
 
     def _save(self, state: GroupState) -> None:
-        kw = {"path": self._db_path} if self._db_path else {}
-        save_group(self.identity.db_key, state.group_id, state.to_dict(), **kw)
+        save_group(self.identity.db_key, state.group_id, state.to_dict(), self._db_path)
 
     def _delete(self, group_id: str) -> None:
         self._groups.pop(group_id, None)
-        kw = {"path": self._db_path} if self._db_path else {}
-        delete_group(group_id, **kw)
+        delete_group(group_id, self._db_path)
 
     def remove_local(self, group_id: str) -> None:
         """Remove grupo do estado local e do banco (usado ao sair do grupo)."""
@@ -262,7 +260,7 @@ class GroupManager:
             return None
         new_members = [m for m in state.members if m.pub_key_hex != pub_key_hex]
         if not new_members:
-            self.delete_group(group_id)
+            self._delete(group_id)
             return None
         new_state = GroupState(
             group_id=state.group_id,
@@ -278,27 +276,6 @@ class GroupManager:
         self._save(new_state)
         self._notify(new_state, "updated")
         return new_state
-
-    # ------------------------------------------------------------------
-    # Sair do grupo (membro comum)
-    # ------------------------------------------------------------------
-
-    def leave(self, group_id: str) -> dict | None:
-        """Retorna LeaveEvent para propagar aos outros membros."""
-        state = self._groups.get(group_id)
-        if state is None:
-            return None
-        my_hex = self.identity.pub_key_bytes.hex()
-        leave_event = {
-            "type":       "leave",
-            "group_id":   group_id,
-            "pub_key_hex": my_hex,
-        }
-        sig = sign(self.identity.private_key, json.dumps(leave_event, sort_keys=True).encode())
-        leave_event["signature_hex"] = sig.hex()
-        self._delete(group_id)
-        self._notify(state, "left")
-        return leave_event
 
     # ------------------------------------------------------------------
     # Admin: apagar grupo

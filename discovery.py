@@ -103,22 +103,37 @@ class _ListenerProtocol(asyncio.DatagramProtocol):
         self.transport = transport
 
     def datagram_received(self, data: bytes, addr: tuple) -> None:
+        import hashlib
         ip = addr[0]
         try:
             payload = json.loads(data.decode())
         except Exception:
             return
-        if payload.get("pub_key_hash") == self._discovery.identity.pub_key_hash:
+
+        pub_key_hex  = payload.get("public_key_hex", "")
+        pub_key_hash = payload.get("pub_key_hash", "")
+
+        # Verifica que pub_key_hash é realmente SHA256(public_key_hex)[:32].
+        # Impede beacons adulterados que atribuam um hash de outra identidade
+        # a uma chave pública diferente, corrompendo o registry.
+        try:
+            expected_hash = hashlib.sha256(bytes.fromhex(pub_key_hex)).hexdigest()[:32]
+        except Exception:
+            return
+        if pub_key_hash != expected_hash:
+            return
+
+        if pub_key_hash == self._discovery.identity.pub_key_hash:
             return  # ignora próprio beacon
 
         if payload.get("bye"):
-            self._discovery.registry.remove(payload["pub_key_hash"])
+            self._discovery.registry.remove(pub_key_hash)
             return
 
         peer = PeerInfo(
-            pub_key_hash=payload["pub_key_hash"],
-            public_key_hex=payload["public_key_hex"],
-            username=payload["username"],
+            pub_key_hash=pub_key_hash,
+            public_key_hex=pub_key_hex,
+            username=payload.get("username", ""),
             ip=ip,
             ws_port=payload["ws_port"],
         )

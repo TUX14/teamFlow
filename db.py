@@ -1,23 +1,22 @@
 """
 Banco mínimo — sqlite3 puro, células sensíveis criptografadas.
 
-Tabelas:
-  users   — credenciais: username (plaintext para lookup) + salt + private_key cifrada com senha
-  groups  — grupos dos quais este peer é membro (células cifradas com db_key)
+Tabelas (banco pessoal por usuário, em data/<username>.db):
+  groups            — grupos dos quais este peer é membro (células cifradas com db_key)
+  trusted_keys      — registro TOFU: pub_key_hash → pub_key_hex + username
+  username_registry — mapeamento username_lower → pub_key_hash para detectar roubo de nick
 
-Peers são descobertos via UDP broadcast e mantidos SOMENTE em RAM — zero
-metadados de rede persistidos em disco.  Mensagens também nunca vão ao banco.
+Peers são mantidos SOMENTE em RAM via PeerRegistry (discovery.py).
+Mensagens são efêmeras em RAM (message_store.py).
+A identidade (keypair) vive em data/identity.key — ver identity.py.
 """
 
 import sqlite3
 from pathlib import Path
-from crypto import encrypt_cell, decrypt_cell, encrypt, decrypt, derive_password_key, new_password_salt
+from crypto import encrypt_cell, decrypt_cell
 
 DATA_DIR = Path(__file__).parent / "data"
 DATA_DIR.mkdir(exist_ok=True)
-
-# banco compartilhado só para autenticação (mapeamento username → DB file)
-AUTH_DB = DATA_DIR / "_auth.db"
 
 
 def _conn(path: Path) -> sqlite3.Connection:
@@ -26,106 +25,13 @@ def _conn(path: Path) -> sqlite3.Connection:
     return c
 
 
-# ---------------------------------------------------------------------------
-# Auth DB — lookup de usuários (username é plaintext, chave cifrada com senha)
-# ---------------------------------------------------------------------------
-
-def _init_auth_db() -> None:
-    with _conn(AUTH_DB) as c:
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                username        TEXT UNIQUE NOT NULL,
-                salt            BLOB NOT NULL,
-                encrypted_key   BLOB NOT NULL,
-                public_key_hex  TEXT NOT NULL,
-                created_at      REAL NOT NULL DEFAULT (unixepoch())
-            )
-        """)
-
-
 def user_db_path(username: str) -> Path:
-    """Caminho do banco de dados pessoal do usuário."""
+    """Caminho do banco pessoal do usuário."""
     return DATA_DIR / f"{username}.db"
 
 
-def user_exists(username: str) -> bool:
-    _init_auth_db()
-    with _conn(AUTH_DB) as c:
-        row = c.execute("SELECT 1 FROM users WHERE username=?", (username,)).fetchone()
-    return row is not None
-
-
-def register_user(username: str, password: str) -> tuple[bytes, bytes]:
-    """
-    Cria novo usuário. Retorna (private_key_bytes, public_key_bytes).
-    Lança ValueError se username já existe.
-    """
-    from crypto import generate_identity_keypair, private_key_to_bytes, public_key_to_bytes
-    _init_auth_db()
-    if user_exists(username):
-        raise ValueError(f"Usuário '{username}' já existe.")
-
-    priv, pub = generate_identity_keypair()
-    priv_raw  = private_key_to_bytes(priv)
-    pub_raw   = public_key_to_bytes(pub)
-    salt      = new_password_salt()
-    pw_key    = derive_password_key(password, salt)
-    enc_key   = encrypt(pw_key, priv_raw, aad=b"auth-private-key")
-
-    with _conn(AUTH_DB) as c:
-        c.execute(
-            "INSERT INTO users (username, salt, encrypted_key, public_key_hex) VALUES (?,?,?,?)",
-            (username, salt, enc_key, pub_raw.hex()),
-        )
-
-    init_user_db(username)
-    return priv_raw, pub_raw
-
-
-def login_user(username: str, password: str) -> tuple[bytes, bytes] | None:
-    """
-    Verifica credenciais. Retorna (private_key_bytes, public_key_bytes) se ok, None se falhou.
-    """
-    _init_auth_db()
-    with _conn(AUTH_DB) as c:
-        row = c.execute(
-            "SELECT salt, encrypted_key, public_key_hex FROM users WHERE username=?", (username,)
-        ).fetchone()
-    if row is None:
-        return None
-    try:
-        pw_key  = derive_password_key(password, bytes(row["salt"]))
-        priv_raw = decrypt(pw_key, bytes(row["encrypted_key"]), aad=b"auth-private-key")
-        pub_raw  = bytes.fromhex(row["public_key_hex"])
-        return priv_raw, pub_raw
-    except Exception:
-        return None  # senha errada
-
-
-def change_password(username: str, old_password: str, new_password: str) -> bool:
-    """Troca a senha. Retorna True se ok."""
-    result = login_user(username, old_password)
-    if result is None:
-        return False
-    priv_raw, _ = result
-    salt   = new_password_salt()
-    pw_key = derive_password_key(new_password, salt)
-    enc    = encrypt(pw_key, priv_raw, aad=b"auth-private-key")
-    with _conn(AUTH_DB) as c:
-        c.execute(
-            "UPDATE users SET salt=?, encrypted_key=? WHERE username=?",
-            (salt, enc, username),
-        )
-    return True
-
-
-# ---------------------------------------------------------------------------
-# Banco pessoal do usuário (known_peers + groups)
-# ---------------------------------------------------------------------------
-
-def init_user_db(username: str) -> Path:
-    path = user_db_path(username)
+def init_db(path: Path) -> None:
+    """Cria tabelas se não existirem."""
     with _conn(path) as c:
         c.executescript("""
             CREATE TABLE IF NOT EXISTS groups (
@@ -138,77 +44,116 @@ def init_user_db(username: str) -> Path:
                 username        TEXT NOT NULL,
                 first_seen      REAL NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS username_registry (
+                username_lower  TEXT PRIMARY KEY,
+                username        TEXT NOT NULL,
+                pub_key_hash    TEXT NOT NULL,
+                first_seen      REAL NOT NULL
+            );
         """)
-    return path
-
-
-def init_db(path: Path | None = None) -> None:
-    if path:
-        with _conn(path) as c:
-            c.executescript("""
-                CREATE TABLE IF NOT EXISTS groups (
-                    group_id    TEXT PRIMARY KEY,
-                    data        BLOB NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS trusted_keys (
-                    pub_key_hash    TEXT PRIMARY KEY,
-                    public_key_hex  TEXT NOT NULL,
-                    username        TEXT NOT NULL,
-                    first_seen      REAL NOT NULL
-                );
-            """)
 
 
 # ---------------------------------------------------------------------------
-# trusted_keys — TOFU (Trust On First Use)
+# trusted_keys + username_registry — TOFU e detecção de roubo de nick
 # ---------------------------------------------------------------------------
 
-def tofu_check(pub_key_hash: str, public_key_hex: str, username: str,
-               path: Path) -> str:
-    """
-    Verifica confiança TOFU. Retorna:
-      'new'     — primeiro contato, chave salva agora
-      'trusted' — chave bate com o registro anterior
-      'changed' — ALERTA: chave diferente da registrada
-    """
-    import time
+def get_trusted_key_hex(pub_key_hash: str, path: Path) -> str | None:
+    """Retorna public_key_hex armazenado para um pub_key_hash, ou None."""
     with _conn(path) as c:
         row = c.execute(
             "SELECT public_key_hex FROM trusted_keys WHERE pub_key_hash=?",
             (pub_key_hash,)
         ).fetchone()
+    return row["public_key_hex"] if row else None
 
-    if row is None:
+
+def tofu_check(pub_key_hash: str, public_key_hex: str, username: str,
+               path: Path) -> tuple[str, dict]:
+    """
+    Verifica segurança TOFU. Retorna (status, detalhes):
+      ('new',      {})                        — primeiro contato, chave e nick salvos
+      ('ok',       {})                        — chave e nick batem com registro anterior
+      ('renamed',  {old_username, new_username}) — mesma chave, nick diferente (renomear legítimo)
+      ('hijacked', {username, known_hash, known_key_hex}) — nick em uso por chave diferente
+    """
+    import time
+    username_lower = username.lower()
+
+    with _conn(path) as c:
+        key_row = c.execute(
+            "SELECT public_key_hex, username FROM trusted_keys WHERE pub_key_hash=?",
+            (pub_key_hash,)
+        ).fetchone()
+        nick_row = c.execute(
+            "SELECT pub_key_hash, username FROM username_registry WHERE username_lower=?",
+            (username_lower,)
+        ).fetchone()
+
+    if key_row is None:
+        # Chave nunca vista — verifica se o nick já está associado a outra chave.
+        if nick_row is not None and nick_row["pub_key_hash"] != pub_key_hash:
+            known_key_hex = get_trusted_key_hex(nick_row["pub_key_hash"], path) or ""
+            return ("hijacked", {
+                "username":      username,
+                "known_hash":    nick_row["pub_key_hash"],
+                "known_key_hex": known_key_hex,
+            })
+        # Genuinamente novo — salva em ambas as tabelas.
+        now = time.time()
         with _conn(path) as c:
             c.execute(
                 "INSERT INTO trusted_keys (pub_key_hash, public_key_hex, username, first_seen)"
                 " VALUES (?, ?, ?, ?)",
-                (pub_key_hash, public_key_hex, username, time.time()),
+                (pub_key_hash, public_key_hex, username, now),
             )
-        return "new"
+            c.execute(
+                "INSERT OR IGNORE INTO username_registry"
+                " (username_lower, username, pub_key_hash, first_seen)"
+                " VALUES (?, ?, ?, ?)",
+                (username_lower, username, pub_key_hash, now),
+            )
+        return ("new", {})
 
-    return "trusted" if row["public_key_hex"] == public_key_hex else "changed"
+    # Chave conhecida — verifica se o nick mudou.
+    stored_username = key_row["username"]
+    if stored_username.lower() == username_lower:
+        return ("ok", {})
+
+    # Mesmo keypair, nick diferente — renomeação legítima.
+    return ("renamed", {
+        "old_username": stored_username,
+        "new_username": username,
+    })
 
 
 def tofu_update(pub_key_hash: str, public_key_hex: str, username: str,
                 path: Path) -> None:
     """Atualiza registro de confiança após confirmação explícita do usuário."""
     import time
+    username_lower = username.lower()
+    now = time.time()
     with _conn(path) as c:
         c.execute(
             "INSERT INTO trusted_keys (pub_key_hash, public_key_hex, username, first_seen)"
             " VALUES (?, ?, ?, ?) ON CONFLICT(pub_key_hash) DO UPDATE"
             " SET public_key_hex=excluded.public_key_hex, username=excluded.username",
-            (pub_key_hash, public_key_hex, username, time.time()),
+            (pub_key_hash, public_key_hex, username, now),
+        )
+        c.execute(
+            "INSERT INTO username_registry"
+            " (username_lower, username, pub_key_hash, first_seen)"
+            " VALUES (?, ?, ?, ?)"
+            " ON CONFLICT(username_lower) DO UPDATE"
+            " SET pub_key_hash=excluded.pub_key_hash, username=excluded.username",
+            (username_lower, username, pub_key_hash, now),
         )
 
 
 # ---------------------------------------------------------------------------
-# groups
+# groups — estado de grupo cifrado célula a célula
 # ---------------------------------------------------------------------------
 
-def save_group(db_key: bytes, group_id: str, group_data: dict, path: Path | None = None) -> None:
-    path = path or DATA_DIR / "default.db"
+def save_group(db_key: bytes, group_id: str, group_data: dict, path: Path) -> None:
     blob = encrypt_cell(db_key, group_data)
     with _conn(path) as c:
         c.execute(
@@ -218,19 +163,7 @@ def save_group(db_key: bytes, group_id: str, group_data: dict, path: Path | None
         )
 
 
-def load_group(db_key: bytes, group_id: str, path: Path | None = None) -> dict | None:
-    path = path or DATA_DIR / "default.db"
-    if not path.exists():
-        return None
-    with _conn(path) as c:
-        row = c.execute("SELECT data FROM groups WHERE group_id=?", (group_id,)).fetchone()
-    if row is None:
-        return None
-    return decrypt_cell(db_key, bytes(row["data"]))
-
-
-def load_all_groups(db_key: bytes, path: Path | None = None) -> list[dict]:
-    path = path or DATA_DIR / "default.db"
+def load_all_groups(db_key: bytes, path: Path) -> list[dict]:
     if not path.exists():
         return []
     with _conn(path) as c:
@@ -246,16 +179,6 @@ def load_all_groups(db_key: bytes, path: Path | None = None) -> list[dict]:
     return result
 
 
-def delete_group(group_id: str, path: Path | None = None) -> None:
-    path = path or DATA_DIR / "default.db"
+def delete_group(group_id: str, path: Path) -> None:
     with _conn(path) as c:
         c.execute("DELETE FROM groups WHERE group_id=?", (group_id,))
-
-
-# mantém compatibilidade antiga
-def save_identity(db_key: bytes, identity: dict, path: Path | None = None) -> None:
-    pass  # identidade agora vive no auth.db via register_user/login_user
-
-
-def load_identity(db_key: bytes, path: Path | None = None) -> dict | None:
-    return None  # use login_user() em vez disso

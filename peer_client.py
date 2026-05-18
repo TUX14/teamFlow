@@ -42,7 +42,7 @@ class OutSession:
     username:      str
     ratchet:       RatchetState
     ws:            object   # websockets.WebSocketClientProtocol
-    _queue: asyncio.Queue = field(default_factory=asyncio.Queue)
+    _queue: asyncio.Queue = field(default_factory=lambda: asyncio.Queue(maxsize=128))
 
     async def send(self, payload: dict) -> None:
         await self._queue.put(payload)
@@ -93,7 +93,7 @@ class PeerClient:
 
             peer_x_pub_bytes  = peer_hello[:32]
             peer_ed_pub_bytes = peer_hello[32:64]
-            peer_username     = peer_hello[64:128].decode("utf-8", errors="replace").strip()
+            peer_username     = peer_hello[64:].decode("utf-8", errors="replace").strip()
 
             my_x_priv, my_x_pub = generate_session_keypair()
             my_ed_pub_bytes      = public_key_to_bytes(self.identity.public_key)
@@ -162,7 +162,7 @@ class PeerClient:
                                         session.ratchet.decrypt(raw).decode()
                                     )
                                 except Exception:
-                                    continue
+                                    break  # ratchet chain corrompida; força reconexão
                                 if self._on_message:
                                     self._on_message(session, payload)
                         except websockets.exceptions.ConnectionClosed:

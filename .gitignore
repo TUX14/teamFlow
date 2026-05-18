@@ -1,34 +1,78 @@
-# Dados gerados em runtime — NUNCA commitar
+# ---------------------------------------------------------------------------
+# Dados sensíveis gerados em runtime — NUNCA commitar
+# ---------------------------------------------------------------------------
 data/
 received/
 uploads/
 
-# Sessoes e storage local de UI
-.nicegui/
+# Defesa em profundidade: ignora chaves e bancos em qualquer lugar da árvore,
+# mesmo que alguém mova ou copie fora de data/
+*.key
+*.db
+*.sqlite
+*.sqlite3
 
-# Configuracao local do Claude Code (permissoes e segredos de maquina)
+# Logs e variáveis de ambiente
+*.log
+.env
+.env.*
+
+# Textual / UI cache
+.textual/
+
+# ---------------------------------------------------------------------------
+# Claude Code — config local de máquina (permissões, segredos)
+# ---------------------------------------------------------------------------
 .claude/settings.local.json
 
+# ---------------------------------------------------------------------------
 # Python
+# ---------------------------------------------------------------------------
 __pycache__/
 **/__pycache__/
 *.pyc
 *.pyo
 *.pyd
-.Python
+*.pyw
 
+# Distribuição / packaging
+dist/
+build/
+*.egg-info/
+*.egg
+MANIFEST
+
+# Testes
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Tipo / linting
+.mypy_cache/
+.ruff_cache/
+
+# ---------------------------------------------------------------------------
 # Virtualenvs
+# ---------------------------------------------------------------------------
 myvenv/
 venv/
 .venv/
 env/
+ENV/
 
+# ---------------------------------------------------------------------------
 # IDEs
+# ---------------------------------------------------------------------------
 .vscode/
 .idea/
 *.swp
 *.swo
+*~
 
-# OS
+# ---------------------------------------------------------------------------
+# SO
+# ---------------------------------------------------------------------------
 .DS_Store
 Thumbs.db
+desktop.ini

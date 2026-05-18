@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import base64
+import math
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
 CHUNK_SIZE    = 64 * 1024  # 64 KB por chunk
 OFFER_TIMEOUT = 60         # segundos para aceitar a oferta
+SEND_WINDOW   = 16         # chunks enviados antes de ceder o event loop
 
 
 @dataclass
@@ -27,13 +30,23 @@ class IncomingOffer:
         return b"".join(self.chunks[i] for i in range(self.total_chunks))
 
 
-def read_chunks(path: Path) -> list[str]:
-    """Divide o arquivo em chunks base64."""
-    data = path.read_bytes()
-    return [
-        base64.b64encode(data[i : i + CHUNK_SIZE]).decode()
-        for i in range(0, len(data), CHUNK_SIZE)
-    ]
+def chunk_count(path: Path) -> int:
+    """Número total de chunks sem ler o arquivo."""
+    size = path.stat().st_size
+    return max(1, math.ceil(size / CHUNK_SIZE)) if size > 0 else 1
+
+
+def iter_chunks(path: Path) -> Iterator[str]:
+    """
+    Gera chunks base64 lendo CHUNK_SIZE bytes por vez.
+    Nunca carrega o arquivo inteiro na memória — seguro para arquivos grandes.
+    """
+    with open(path, "rb") as f:
+        while True:
+            data = f.read(CHUNK_SIZE)
+            if not data:
+                break
+            yield base64.b64encode(data).decode()
 
 
 def save_file(filename: str, data: bytes) -> Path:
@@ -55,4 +68,6 @@ def save_file(filename: str, data: bytes) -> Path:
 def human_size(n: int) -> str:
     if n >= 1024 * 1024:
         return f"{n / (1024 * 1024):.1f} MB"
-    return f"{n // 1024} KB"
+    if n >= 1024:
+        return f"{n / 1024:.1f} KB"
+    return f"{n} B"

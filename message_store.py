@@ -29,7 +29,8 @@ class ConversationStore:
 
     def __init__(self):
         self._messages: deque[Message] = deque(maxlen=MAX_MESSAGES_PER_CONV)
-        self._seen_uuids: set[str]     = set()
+        # dict mantém ordem de inserção (Python 3.7+); serve como conjunto ordenado
+        self._seen_uuids: dict[str, None] = {}
         self._callbacks: list[Callable[[Message], None]] = []
 
     def on_new_message(self, fn: Callable[[Message], None]) -> None:
@@ -39,11 +40,10 @@ class ConversationStore:
         """Retorna True se adicionada, False se duplicata."""
         if msg.uuid in self._seen_uuids:
             return False
-        self._seen_uuids.add(msg.uuid)
+        self._seen_uuids[msg.uuid] = None
+        # remove o mais antigo quando a janela de deduplicação dobra o limite
         if len(self._seen_uuids) > MAX_MESSAGES_PER_CONV * 2:
-            # evita crescimento ilimitado de seen_uuids
-            oldest = list(self._seen_uuids)[:MAX_MESSAGES_PER_CONV]
-            self._seen_uuids = set(oldest)
+            self._seen_uuids.pop(next(iter(self._seen_uuids)))
         self._messages.append(msg)
         for fn in self._callbacks:
             try:
@@ -57,7 +57,7 @@ class ConversationStore:
 
     def clear(self) -> None:
         self._messages.clear()
-        self._seen_uuids.clear()
+        self._seen_uuids.clear()  # dict.clear() funciona igual ao set.clear()
 
 
 class MessageStore:

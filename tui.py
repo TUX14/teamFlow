@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime
 from pathlib import Path
+import sys
 from typing import TYPE_CHECKING
 
 from textual.app import App, ComposeResult
@@ -21,14 +22,110 @@ if TYPE_CHECKING:
 
 # ── Modais ────────────────────────────────────────────────────────────────────
 
-class SetupModal(ModalScreen[str]):
-    """Primeiro acesso — escolhe username."""
+class SetupModal(ModalScreen[bool]):
+    """
+    Primeiro acesso — cria nova identidade.
+    Solicita username e senha; chama identity.create() e node.set_identity().
+    """
 
     def compose(self) -> ComposeResult:
         with Vertical():
             yield Label("[bold]TeamFlow — primeiro acesso[/bold]")
             yield Label("Como você quer ser conhecido na rede?")
-            yield Input(placeholder="seu nome (mín. 2 caracteres)", id="name-input")
+            yield Input(placeholder="nome (mín. 2 caracteres)", id="name-input")
+            yield Label("Crie uma senha para proteger sua chave privada:")
+            yield Input(placeholder="senha (mín. 4 caracteres)", id="pw-input",  password=True)
+            yield Input(placeholder="confirme a senha",          id="pw2-input", password=True)
+            yield Button("Criar identidade", variant="primary", id="confirm")
+
+    def on_mount(self) -> None:
+        v = self.query_one(Vertical)
+        v.styles.width            = "100%"
+        v.styles.height           = "100%"
+        v.styles.padding          = (4, 8)
+        v.styles.align_horizontal = "center"
+        v.styles.align_vertical   = "middle"
+        self.query_one("#name-input").focus()
+
+    def on_input_submitted(self, _: Input.Submitted) -> None:
+        self._save()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "confirm":
+            self._save()
+
+    def _save(self) -> None:
+        from identity import create as identity_create
+        name = self.query_one("#name-input",  Input).value.strip()
+        pw   = self.query_one("#pw-input",    Input).value
+        pw2  = self.query_one("#pw2-input",   Input).value
+        if len(name) < 2:
+            self.query_one("#name-input", Input).placeholder = "mínimo 2 caracteres!"
+            return
+        if len(pw) < 4:
+            self.notify("Senha precisa ter no mínimo 4 caracteres.", severity="error")
+            return
+        if pw != pw2:
+            self.notify("As senhas não coincidem.", severity="error")
+            return
+        identity = identity_create(name, pw)
+        self.app.node.set_identity(identity)  # type: ignore[attr-defined]
+        self.dismiss(True)
+
+
+class LoginModal(ModalScreen[bool]):
+    """
+    Autenticação com senha para identidade já existente (formato cifrado).
+    Chama identity.load_encrypted() e node.set_identity().
+    Exibe erro inline se a senha estiver incorreta — não fecha o modal.
+    """
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Label("[bold]TeamFlow — autenticação[/bold]")
+            yield Label("Digite sua senha para desbloquear a identidade:")
+            yield Input(placeholder="senha", id="pw-input", password=True)
+            yield Button("Entrar", variant="primary", id="confirm")
+
+    def on_mount(self) -> None:
+        v = self.query_one(Vertical)
+        v.styles.width            = "100%"
+        v.styles.height           = "100%"
+        v.styles.padding          = (4, 8)
+        v.styles.align_horizontal = "center"
+        v.styles.align_vertical   = "middle"
+        self.query_one(Input).focus()
+
+    def on_input_submitted(self, _: Input.Submitted) -> None:
+        self._login()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "confirm":
+            self._login()
+
+    def _login(self) -> None:
+        from identity import load_encrypted
+        pw = self.query_one(Input).value
+        try:
+            identity = load_encrypted(pw)
+            self.app.node.set_identity(identity)  # type: ignore[attr-defined]
+            self.dismiss(True)
+        except ValueError:
+            self.notify("Senha incorreta. Tente novamente.", severity="error")
+            self.query_one(Input).clear()
+            self.query_one(Input).focus()
+
+
+class _UsernameModal(ModalScreen[bool]):
+    """
+    Define username para identidade legada que não tem nome gravado.
+    Não cria nova chave — apenas salva o username.
+    """
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Label("[bold]TeamFlow — defina seu nome[/bold]")
+            yield Input(placeholder="nome (mín. 2 caracteres)", id="name-input")
             yield Button("Confirmar", variant="primary", id="confirm")
 
     def on_mount(self) -> None:
@@ -55,11 +152,11 @@ class SetupModal(ModalScreen[str]):
             return
         save_username(name)
         self.app.node.identity.username = name  # type: ignore[attr-defined]
-        self.dismiss(name)
+        self.dismiss(True)
 
 
 class TofuModal(ModalScreen[bool]):
-    """Alerta de mudança de chave — TOFU."""
+    """Alerta de segurança TOFU — personificação ou mudança de chave."""
 
     def __init__(self, pub_key_hash: str, alert: dict) -> None:
         super().__init__()
@@ -71,9 +168,18 @@ class TofuModal(ModalScreen[bool]):
         words = self._alert["words"]
         with Vertical():
             yield Label("[bold red]⚠  ALERTA DE SEGURANÇA[/bold red]")
-            yield Label(f'A chave de [bold]{name}[/bold] mudou desde o último contato.')
-            yield Label("Nova fingerprint:")
+            known_words = self._alert.get("known_words", "desconhecida")
+            yield Label(
+                f'[bold]{name}[/bold] está usando uma chave '
+                f'[bold red]diferente[/bold red] da registrada.'
+            )
+            yield Label("Pode ser tentativa de personificação.")
+            yield Label("")
+            yield Label("Chave registrada (verificada anteriormente):")
+            yield Label(f"[bold green]{known_words}[/bold green]")
+            yield Label("Chave atual (não verificada):")
             yield Label(f"[bold yellow]{words}[/bold yellow]")
+            yield Label("")
             yield Label("Confirme a identidade por outro canal antes de aceitar.")
             with Horizontal():
                 yield Button("Aceitar nova chave", variant="warning", id="accept")
@@ -91,6 +197,8 @@ class TofuModal(ModalScreen[bool]):
         accepted = event.button.id == "accept"
         if accepted:
             self.app.node.dismiss_tofu(self._hash)  # type: ignore[attr-defined]
+        # Remove do conjunto para que futuros alertas do mesmo peer sejam exibidos.
+        self.app._shown_tofu.discard(self._hash)  # type: ignore[attr-defined]
         self.dismiss(accepted)
 
 
@@ -180,7 +288,6 @@ class OutputModal(ModalScreen[None]):
 class _BaseScreen(Screen):
     BINDINGS = []
 
-    # Implementado pelas subclasses: exibe texto de saída de comandos
     def _output(self, title: str, lines: list[str]) -> None:
         self.app.push_screen(OutputModal(title, lines))
 
@@ -337,7 +444,6 @@ class HomeScreen(_BaseScreen):
         from wordlist import pub_to_words
         node = self.app.node  # type: ignore[attr-defined]
 
-        # Só reconstrói a tabela de peers se algo mudou
         peers     = node.registry.all_online()
         new_peers = tuple((p.pub_key_hash, p.connected) for p in peers)
         if new_peers != self._peer_state:
@@ -350,7 +456,6 @@ class HomeScreen(_BaseScreen):
                 table.add_row(chip, dot, peer.username, pub_to_words(peer.public_key_hex),
                               key=peer.pub_key_hash)
 
-        # Só reconstrói a lista de grupos se algo mudou
         groups     = node.groups.all() if node.groups else []
         new_groups = tuple(gs.group_id for gs in groups)
         if new_groups != self._group_state:
@@ -468,9 +573,6 @@ class ChatScreen(_BaseScreen):
 
     def _sys(self, text: str) -> None:
         self.query_one("#messages", RichLog).write(f"[dim italic]{text}[/dim italic]")
-
-    # OutputModal é usada para saída dos comandos compartilhados (/me, /peers, etc.)
-    # mas /whois e /ping escrevem diretamente no log do chat para manter o contexto.
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         text = event.value.strip()
@@ -648,13 +750,34 @@ class TeamFlowApp(App):
         self._shown_tofu: set[str] = set()
 
     async def on_mount(self) -> None:
-        if not self.node.identity.username:
-            await self.push_screen(SetupModal(), self._after_setup)
-        else:
-            await self._start()
+        from identity import key_status, load_legacy
+        status = key_status()
 
-    async def _after_setup(self, username: str | None) -> None:
-        if username:
+        if status == "none":
+            # Primeiro acesso: cria identidade com senha
+            await self.push_screen(SetupModal(), self._after_auth)
+
+        elif status == "encrypted":
+            # Identidade existente protegida por senha
+            await self.push_screen(LoginModal(), self._after_auth)
+
+        else:
+            # Formato legado (32 bytes raw) — carrega sem senha
+            identity = load_legacy()
+            self.node.set_identity(identity)
+            if not identity.username:
+                # Edge case: chave existe mas username não foi salvo
+                await self.push_screen(_UsernameModal(), self._after_auth)
+            else:
+                self.notify(
+                    "Identidade legada (sem proteção por senha). "
+                    "Apague data/identity.key e reinicie para criar com senha.",
+                    severity="warning", timeout=10,
+                )
+                await self._start()
+
+    async def _after_auth(self, result: bool | None) -> None:
+        if result:
             await self._start()
 
     async def _start(self) -> None:
@@ -664,13 +787,23 @@ class TeamFlowApp(App):
         await self.push_screen(HomeScreen())
 
     def _on_node_event(self, event: str, data) -> None:
-        if event == "file_offer":
+        if event == "message":
+            # Toca bell do terminal apenas se o usuário não estiver nessa conversa.
+            current = self.screen
+            if not (hasattr(current, "chat_id") and current.chat_id == data):
+                sys.stdout.write("\a")
+                sys.stdout.flush()
+        elif event == "file_offer":
             from file_transfer import human_size
             self.notify(
                 f"📎 {data.sender_name}: {data.filename} ({human_size(data.size)})"
                 f" — abra o chat e /accept",
                 timeout=15,
             )
+        elif event == "peer_renamed":
+            old = data["old_username"]
+            new = data["new_username"]
+            self.notify(f"{old} alterou o nome para {new}.", title="Rename", timeout=8)
 
     def _check_tofu(self) -> None:
         for h, alert in list(self.node.tofu_alerts.items()):

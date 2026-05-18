@@ -24,7 +24,7 @@ def _step(chain_key: bytes) -> tuple[bytes, bytes]:
 
 
 class RatchetState:
-    """Thread-safe symmetric ratchet for one P2P session."""
+    """Symmetric ratchet for one P2P session (single-threaded asyncio use only)."""
 
     __slots__ = ("_send", "_recv")
 

@@ -18,6 +18,7 @@ Após handshake, todas as frames são:
 """
 
 import asyncio
+import hashlib
 import json
 import os
 from dataclasses import dataclass
@@ -52,10 +53,6 @@ class PeerSession:
     async def send(self, payload: dict) -> None:
         data = self.ratchet.encrypt(json.dumps(payload).encode())
         await self.ws.send(data)
-
-    async def recv(self) -> dict:
-        raw = await self.ws.recv()
-        return json.loads(self.ratchet.decrypt(raw).decode())
 
 
 class PeerServer:
@@ -100,7 +97,7 @@ class PeerServer:
 
             peer_x_pub_bytes  = peer_hello[:32]
             peer_ed_pub_bytes = peer_hello[32:64]
-            peer_username     = peer_hello[64:128].decode("utf-8", errors="replace").strip()
+            peer_username     = peer_hello[64:].decode("utf-8", errors="replace").strip()
 
             shared = x25519_exchange(my_x_priv, peer_x_pub_bytes)
             session_key = derive_session_key(
@@ -123,7 +120,6 @@ class PeerServer:
 
             await asyncio.wait_for(ws.send(b"OK"), HANDSHAKE_TIMEOUT)
 
-            import hashlib
             pk_hash = hashlib.sha256(peer_ed_pub_bytes).hexdigest()[:32]
 
             return PeerSession(
@@ -152,7 +148,7 @@ class PeerServer:
                 try:
                     payload = json.loads(session.ratchet.decrypt(raw).decode())
                 except Exception:
-                    continue
+                    break  # ratchet chain corrompida; força reconexão
                 if self._on_message:
                     self._on_message(session, payload)
         except websockets.exceptions.ConnectionClosed:
