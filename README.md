@@ -20,7 +20,6 @@ Mensageiro P2P criptografado para redes locais. Sem servidor central, sem conta,
 - [Comandos](#comandos)
 - [Arquitetura](#arquitetura)
 - [Estrutura do projeto](#estrutura-do-projeto)
-- [Estado atual para IA](#estado-atual-para-ia)
 
 ---
 
@@ -29,7 +28,8 @@ Mensageiro P2P criptografado para redes locais. Sem servidor central, sem conta,
 - Descoberta automatica de peers na LAN via UDP broadcast
 - Mensagens diretas (DM) entre dois peers
 - Grupos com controle de membros pelo admin
-- Transferencia de arquivos em DMs (chunks de 64 KB)
+- **Push-to-talk** estilo walkie-talkie em DMs e grupos (Ctrl+T)
+- Transferencia de arquivos em DMs (streaming em chunks de 64 KB)
 - Fingerprint mnemonica em portugues para verificacao de identidade
 - Alerta TOFU (Trust On First Use) quando a chave de um peer muda
 - Identicons pixel-art gerados a partir da chave publica
@@ -50,10 +50,11 @@ Mensageiro P2P criptografado para redes locais. Sem servidor central, sem conta,
 
 **Propriedades garantidas:**
 
-- Mensagens nunca sao gravadas em disco (apenas em RAM, ate fechar o app)
+- Mensagens e audio nunca sao gravados em disco (apenas em RAM, ate fechar o app)
 - A private key e cifrada com PBKDF2 + ChaCha20-Poly1305 (novos usuarios)
 - Identidades no formato legado (32 bytes raw) sao protegidas apenas por chmod 600
 - Session keys sao efemeras: cada conexao usa um par X25519 diferente
+- Mensagens e frames de voz PTT trafegam cifrados pelo ratchet de sessao (ChaCha20-Poly1305, forward secrecy por frame)
 - Mensagens de grupo tem dupla camada de cifra: ratchet de sessao + group_key
 - Remocao de membro rotaciona a group_key (mensagens futuras ilegíveis para o removido)
 - Estados de grupo sao assinados pelo admin com Ed25519 e versionados
@@ -79,7 +80,11 @@ pip install -r requirements.txt
 textual>=0.70.0
 websockets>=12.0
 cryptography>=43.0.0
+sounddevice>=0.4.6
+numpy>=1.24.0
 ```
+
+> `sounddevice` e `numpy` sao necessarios apenas para o push-to-talk. O app funciona normalmente sem eles; o PTT fica desabilitado com uma notificacao se os pacotes nao estiverem instalados ou se nao houver dispositivo de audio.
 
 ---
 
@@ -131,6 +136,7 @@ Cada instancia precisa estar **na mesma rede local**. Peers aparecem automaticam
 | `/send <caminho>` | Envia arquivo ao peer (somente DMs, sem espacos no caminho) |
 | `/accept` | Aceita arquivo recebido |
 | `/reject` | Recusa arquivo recebido |
+| `Ctrl+T` | Ativa/desativa push-to-talk (microfone) |
 
 ---
 
@@ -146,13 +152,14 @@ run.py
         │     └── ratchet.py   symmetric double ratchet por sessao
         ├── groups.py          estados de grupo assinados + group_key
         ├── message_store.py   store efemero em RAM
-        ├── file_transfer.py   transferencia por chunks
+        ├── file_transfer.py   transferencia por chunks (streaming)
+        ├── voice.py           PTTEngine (captura mic) + _Player (reproducao com jitter buffer)
         └── db.py              SQLite (grupos cifrados + TOFU)
   └── tui.py           interface Textual
         ├── SetupModal   primeiro acesso (username + senha)
         ├── LoginModal   autenticacao em acessos subsequentes
         ├── HomeScreen   peers + grupos
-        └── ChatScreen   chat + comandos
+        └── ChatScreen   chat + PTT + comandos
 ```
 
 ### Handshake de sessao
@@ -176,6 +183,18 @@ Peer A (server)                    Peer B (client)
 ```
 
 O campo `username` no HELLO e UTF-8 de comprimento variavel (bytes 64 ate o fim do frame).
+
+### Push-to-talk
+
+O PTT transmite audio PCM (16 kHz, mono, int16) em chunks de 20 ms codificados em base64, enviados como payloads JSON comuns sobre o WebSocket ja cifrado pelo ratchet de sessao. Cada frame de voz tem forward secrecy individual — um sniffer na LAN ve apenas bytes cifrados.
+
+```
+Microfone → PTTEngine (chunks de 20 ms)
+  → base64 PCM → make_voice_frame() → ratchet.encrypt() → WebSocket
+  → ratchet.decrypt() → _Player.feed() → saida de audio (jitter buffer por peer)
+```
+
+Para grupos, os frames sao enviados individualmente a cada membro via seu canal ratchet dedicado (fan-out identico ao de mensagens de grupo, sem a camada extra de `group_key`). A barra de status no chat exibe `● TX` ao transmitir e `🔊 nome` ao receber.
 
 ### Criptografia de mensagens de grupo
 
@@ -207,12 +226,13 @@ teamFlow/
 ├── discovery.py        descoberta UDP na LAN (porta 47777)
 ├── peer_server.py      servidor WebSocket P2P (porta 47778)
 ├── peer_client.py      cliente WebSocket P2P com reconexao exponencial
-├── protocol.py         construtores de payloads JSON (sem Dispatcher — despacho feito em node.py)
+├── protocol.py         construtores de payloads JSON (sem Dispatcher — despacho em node.py)
 ├── node.py             orquestrador central; set_identity() → start() → stop()
 ├── groups.py           logica de grupos: GroupState, GroupManager
-├── message_store.py    store efemero de mensagens (RAM, deque maxlen=200)
+├── message_store.py    store efemero de mensagens em RAM (ate 1 GB, evicao FIFO)
 ├── db.py               SQLite: grupos cifrados (db_key) + TOFU (trusted_keys)
-├── file_transfer.py    transferencia de arquivos em chunks de 64 KB
+├── file_transfer.py    transferencia de arquivos em chunks de 64 KB (streaming)
+├── voice.py            PTTEngine (captura mic, 20 ms) + _Player (jitter buffer + mix)
 ├── tui.py              interface Textual: SetupModal, LoginModal, HomeScreen, ChatScreen
 ├── avatar.py           identicons pixel-art para o terminal
 ├── wordlist.py         fingerprint mnemonica (256 palavras PT, 5 palavras = 40 bits)
@@ -223,105 +243,9 @@ teamFlow/
     └── <usuario>.db    banco pessoal (grupos + trusted_keys)
 ```
 
----
-
-## Estado atual para IA
-
-Esta secao documenta decisoes de design e o estado exato do codigo para facilitar analise futura.
-
-### Fluxo de inicializacao
-
-```
-run.py
-  Node()                        # sem identidade
-  TeamFlowApp(node).run()
-    on_mount()
-      key_status() == "none"    → SetupModal  → identity.create(user, pw) → node.set_identity()
-      key_status() == "encrypted" → LoginModal → identity.load_encrypted(pw) → node.set_identity()
-      key_status() == "legacy"  → load_legacy() → node.set_identity() [sem senha, notificacao]
-    _after_auth(True) → _start()
-      node.start()              # init db, groups, discovery, ws server
-      push_screen(HomeScreen())
-```
-
-### Formato de identity.key
-
-- **92 bytes (novo, cifrado):** `salt(32) + nonce(12) + ciphertext(32) + tag(16)`
-  - Chave derivada: `PBKDF2-HMAC-SHA256(password, salt, 600_000 iter) → 32 bytes`
-  - Cifra: `ChaCha20-Poly1305(pw_key, priv_raw_ed25519, aad=b"identity-key")`
-- **32 bytes (legado, raw):** Ed25519 private key sem senha; protegida por chmod 600
-
-### Banco de dados (SQLite)
-
-Arquivo: `data/<username>.db`. Criado por `db.init_db(path)`.
-
-Tabelas:
-- `groups(group_id TEXT PK, data BLOB)` — `data` e `encrypt_cell(db_key, group_dict)` (ChaCha20-Poly1305); `db_key` e derivada da private key via HKDF
-- `trusted_keys(pub_key_hash TEXT PK, public_key_hex, username, first_seen)` — plaintext; usado para TOFU
-
-Peers e mensagens nao sao persistidos. Toda a rede e reconstruida via UDP beacon na proxima sessao.
-
-### Protocolo de mensagens (payloads JSON)
-
-Todos os payloads trafegam cifrados pelo ratchet de sessao. O campo `type` identifica o tipo.
-
-| type | Campos relevantes | Notas |
-|---|---|---|
-| `chat` | uuid, sender_hash, sender_name, text, ts | DM plaintext (dentro do ratchet) |
-| `group_msg` | uuid, sender_hash, sender_name, group_id, text, ts | `text` = hex de `ChaCha20(group_key, plaintext, aad=b"group-msg")` |
-| `group_state` | state (dict serializado de GroupState) | Distribuido pelo admin; assinado com Ed25519 |
-| `invite` | group_state, invitee_pub_key_hex, invitee_username, inviter_pub_key_hex | |
-| `join_request` | group_id, pub_key_hex, username | Enviado pelo convidado ao admin |
-| `leave` | group_id, pub_key_hex | |
-| `dissolve` | group_id, version, signature_hex, admin_pub_key_hex | |
-| `ack` | uuid | Confirmacao de chat DM |
-| `ping`/`pong` | uuid, ts | Medicao de latencia |
-| `file_offer` | file_id, sender_name, filename, size, total_chunks | |
-| `file_chunk` | file_id, index, total, data (base64) | |
-| `file_accept`/`file_reject` | file_id | |
-
-### GroupState
-
-```python
-@dataclass
-class GroupState:
-    group_id:          str      # UUID
-    name:              str
-    admin_pub_key_hex: str      # Ed25519 pub do admin (hex)
-    members:           list[Member]   # Member(pub_key_hex, username)
-    group_key_hex:     str      # 32 bytes hex; usada para cifrar group_msg
-    version:           int      # incrementado a cada mudanca
-    signature_hex:     str      # Ed25519 sign(admin_priv, canonical_bytes())
-```
-
-`canonical_bytes()` serializa `group_id, name, admin_pub_key_hex, sorted(member pub keys), group_key_hex, version` como JSON com `sort_keys=True`. A assinatura garante que qualquer peer pode verificar o estado sem confiar no emissor.
-
-### Ratchet
-
-Implementacao symmetric double ratchet simplificada (sem DH ratchet — as session keys sao efemeras por si so via X25519 por conexao).
-
-```
-chain_a = HKDF(session_key, info=b"ratchet-chain-A")
-chain_b = HKDF(session_key, info=b"ratchet-chain-B")
-server: send=chain_a, recv=chain_b
-client: send=chain_b, recv=chain_a
-
-Para cada mensagem:
-  msg_key, next_chain = HKDF(chain, "ratchet-msg-key"), HKDF(chain, "ratchet-chain-step")
-  ciphertext = ChaCha20-Poly1305(msg_key, plaintext)
-```
-
-### Descoberta UDP
-
-- Porta 47777, broadcast `255.255.255.255`
-- Beacon a cada 5s: `{pub_key_hash, public_key_hex, username, ws_port, ts}`
-- Peer expirado apos 30s sem beacon (6 beacons perdidos)
-- Beacon `{bye: True, pub_key_hash}` enviado ao fechar o app
-
 ### Limitacoes conhecidas
 
 - Transporte WebSocket sem TLS (`ws://`); cifra e feita na camada de aplicacao
-- Transferencia de arquivos lê o arquivo inteiro na memoria antes de chunkar (`file_transfer.read_chunks`)
 - Sem re-entrega garantida de mensagens (best-effort via WebSocket)
 - Sem suporte a multiplas instancias do mesmo usuario na rede
-- Historico de mensagens limitado a 200 por conversa (RAM); sem persistencia
+- Historico de mensagens efemero (RAM); perdido ao fechar o app
