@@ -1,9 +1,8 @@
 """
-Store efêmero de mensagens — apenas em memória, zero disco.
+Store de mensagens em RAM — alocação dinâmica até MAX_BYTES (1 GB).
 
-Cada conversa (DM ou grupo) tem um deque com limite de tamanho.
-Mensagens identificadas por UUID para deduplicação (fan-out pode causar duplicatas).
-Tudo some ao fechar a aplicação.
+Estrutura: deque global de (conv_id, Message) em ordem de inserção.
+Deduplicação por UUID. Evicção FIFO quando o orçamento de memória é atingido.
 """
 
 import time
@@ -11,7 +10,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Callable
 
-MAX_MESSAGES_PER_CONV = 200  # limite por conversa em memória
+MAX_BYTES = 1 * 1024 ** 3  # 1 GB
 
 
 @dataclass
@@ -24,67 +23,53 @@ class Message:
     is_mine:     bool  = False
 
 
-class ConversationStore:
-    """Store de uma única conversa (DM ou grupo)."""
+class MessageStore:
+    def __init__(self) -> None:
+        self._msgs:      deque[tuple[str, Message]]              = deque()
+        self._seen:      dict[str, None]                         = {}
+        self._total:     int                                     = 0
+        self._callbacks: dict[str, list[Callable[[Message], None]]] = {}
 
-    def __init__(self):
-        self._messages: deque[Message] = deque(maxlen=MAX_MESSAGES_PER_CONV)
-        # dict mantém ordem de inserção (Python 3.7+); serve como conjunto ordenado
-        self._seen_uuids: dict[str, None] = {}
-        self._callbacks: list[Callable[[Message], None]] = []
+    @staticmethod
+    def _size(msg: Message) -> int:
+        return 64 + len(msg.uuid) + len(msg.sender_hash) + len(msg.sender_name) + len(msg.text.encode())
 
-    def on_new_message(self, fn: Callable[[Message], None]) -> None:
-        self._callbacks.append(fn)
-
-    def add(self, msg: Message) -> bool:
+    def add(self, conv_id: str, msg: Message) -> bool:
         """Retorna True se adicionada, False se duplicata."""
-        if msg.uuid in self._seen_uuids:
+        if msg.uuid in self._seen:
             return False
-        self._seen_uuids[msg.uuid] = None
-        # remove o mais antigo quando a janela de deduplicação dobra o limite
-        if len(self._seen_uuids) > MAX_MESSAGES_PER_CONV * 2:
-            self._seen_uuids.pop(next(iter(self._seen_uuids)))
-        self._messages.append(msg)
-        for fn in self._callbacks:
+        self._seen[msg.uuid] = None
+        self._msgs.append((conv_id, msg))
+        self._total += self._size(msg)
+        while self._total > MAX_BYTES:
+            old_cid, old_msg = self._msgs.popleft()
+            self._total -= self._size(old_msg)
+            self._seen.pop(old_msg.uuid, None)
+        for fn in self._callbacks.get(conv_id, ()):
             try:
                 fn(msg)
             except Exception:
                 pass
         return True
 
-    def all(self) -> list[Message]:
-        return list(self._messages)
-
-    def clear(self) -> None:
-        self._messages.clear()
-        self._seen_uuids.clear()  # dict.clear() funciona igual ao set.clear()
-
-
-class MessageStore:
-    """
-    Store global — uma ConversationStore por conversa.
-
-    Chave de conversa:
-      DM    → pub_key_hash do peer remoto
-      Grupo → group_id (UUID do grupo)
-    """
-
-    def __init__(self):
-        self._convs: dict[str, ConversationStore] = {}
-
-    def conversation(self, conv_id: str) -> ConversationStore:
-        if conv_id not in self._convs:
-            self._convs[conv_id] = ConversationStore()
-        return self._convs[conv_id]
-
-    def add(self, conv_id: str, msg: Message) -> bool:
-        return self.conversation(conv_id).add(msg)
-
     def get(self, conv_id: str) -> list[Message]:
-        return self.conversation(conv_id).all()
+        return [m for cid, m in self._msgs if cid == conv_id]
 
     def on_new_message(self, conv_id: str, fn: Callable[[Message], None]) -> None:
-        self.conversation(conv_id).on_new_message(fn)
+        self._callbacks.setdefault(conv_id, []).append(fn)
+
+    def clear_conversation(self, conv_id: str) -> None:
+        """Libera todas as mensagens de uma conversa da RAM."""
+        kept = deque()
+        for cid, msg in self._msgs:
+            if cid == conv_id:
+                self._total -= self._size(msg)
+                self._seen.pop(msg.uuid, None)
+            else:
+                kept.append((cid, msg))
+        self._msgs = kept
 
     def drop_conversation(self, conv_id: str) -> None:
-        self._convs.pop(conv_id, None)
+        """Libera mensagens e callbacks de uma conversa (usada ao sair)."""
+        self.clear_conversation(conv_id)
+        self._callbacks.pop(conv_id, None)

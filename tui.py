@@ -8,6 +8,7 @@ from pathlib import Path
 import sys
 from typing import TYPE_CHECKING
 
+from textual import events
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen, Screen
@@ -225,7 +226,7 @@ class HelpModal(ModalScreen[None]):
             yield Label("[bold cyan]No chat:[/bold cyan]")
             yield Label("  /back                volta para a lista")
             yield Label("  /whois               fingerprint do peer ativo")
-            yield Label("  /clear               limpa o log")
+            yield Label("  /clear               apaga o histórico desta conversa da memória")
             yield Label("  /ping [nome]         latência do peer (padrão: atual)")
             yield Label("  /invite <nome>       convida peer para o grupo")
             yield Label("  /kick <nome>         remove membro do grupo (admin)")
@@ -233,7 +234,9 @@ class HelpModal(ModalScreen[None]):
             yield Label("  /dissolve            dissolve o grupo (somente admin)")
             yield Label("  /send <caminho>      envia arquivo (sem espaços no caminho)")
             yield Label("  /accept              aceita arquivo recebido")
+            yield Label("  /cancel              cancela transferência em andamento")
             yield Label("  /reject              recusa arquivo recebido")
+            yield Label("  Ctrl+T               push-to-talk (ativa/desativa microfone)")
             yield Label("")
             yield Button("Fechar", variant="primary", id="close")
 
@@ -512,17 +515,23 @@ class HomeScreen(_BaseScreen):
 # ── Tela de chat ──────────────────────────────────────────────────────────────
 
 class ChatScreen(_BaseScreen):
+    BINDINGS = [("ctrl+t", "ptt_toggle", "PTT")]
+
     def __init__(self, chat_id: str, title: str) -> None:
         super().__init__()
-        self.chat_id     = chat_id
-        self._title      = title
-        self._last_count = -1
+        self.chat_id      = chat_id
+        self._title       = title
+        self._last_count  = -1
+        self._history:    list[str] = []
+        self._hist_idx:   int       = -1
+        self._hist_draft: str       = ""
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="peer-header"):
             yield Static("", id="peer-avatar")
             yield Label(self._title, id="chat-title")
         yield RichLog(id="messages", highlight=True, markup=True, wrap=True)
+        yield Static("", id="voice-bar")
         yield Input(placeholder="> mensagem ou /comando  (/help para ajuda)", id="msg-input")
 
     def on_mount(self) -> None:
@@ -532,9 +541,13 @@ class ChatScreen(_BaseScreen):
         header.styles.align_vertical = "middle"
         self.query_one("#chat-title").styles.padding = (0, 2)
         self.query_one("#messages").styles.height = "1fr"
+        bar = self.query_one("#voice-bar", Static)
+        bar.styles.height = 1
+        bar.display = False
         self._refresh_peer_avatar()
         self.query_one(Input).focus()
         self.set_interval(0.5, self._poll)
+        self._update_voice_bar()
 
     def _refresh_peer_avatar(self) -> None:
         import hashlib
@@ -549,8 +562,9 @@ class ChatScreen(_BaseScreen):
         self.query_one("#peer-avatar", Static).update(make_avatar(seed))
 
     def _poll(self) -> None:
-        count = len(self.app.node.store.get(self.chat_id))  # type: ignore[attr-defined]
-        if count != self._last_count:
+        node  = self.app.node  # type: ignore[attr-defined]
+        count = len(node.store.get(self.chat_id))
+        if count != self._last_count or self.chat_id in node._incoming_offers:
             self._last_count = count
             self._render_messages()
 
@@ -569,20 +583,54 @@ class ChatScreen(_BaseScreen):
             else:
                 chip = make_chip(m.sender_hash) if m.sender_hash else ""
                 log.write(f"[dim]{ts}[/dim] {chip} [bold]{m.sender_name}[/bold]: {m.text}")
+        offer = node._incoming_offers.get(self.chat_id)
+        if offer and offer.is_active:
+            log.write("📎 " + offer.progress_line())
         log.scroll_end(animate=False)
 
     def _sys(self, text: str) -> None:
         self.query_one("#messages", RichLog).write(f"[dim italic]{text}[/dim italic]")
+
+    def on_key(self, event: events.Key) -> None:
+        inp = self.query_one("#msg-input", Input)
+        if not inp.has_focus:
+            return
+        if event.key == "up":
+            event.prevent_default()
+            if not self._history:
+                return
+            if self._hist_idx == -1:
+                self._hist_draft = inp.value
+            self._hist_idx = min(self._hist_idx + 1, len(self._history) - 1)
+            inp.value = self._history[self._hist_idx]
+            inp.cursor_position = len(inp.value)
+        elif event.key == "down":
+            event.prevent_default()
+            if self._hist_idx == -1:
+                return
+            self._hist_idx -= 1
+            inp.value = self._hist_draft if self._hist_idx == -1 else self._history[self._hist_idx]
+            inp.cursor_position = len(inp.value)
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         text = event.value.strip()
         event.input.clear()
         if not text:
             return
+        if not self._history or self._history[0] != text:
+            self._history.insert(0, text)
+        self._hist_idx   = -1
+        self._hist_draft = ""
         if text.startswith("/"):
             self._command(text[1:])
         else:
             self._send(text)
+
+    def on_unmount(self) -> None:
+        node = self.app.node  # type: ignore[attr-defined]
+        if node.ptt_active and node._ptt_conv == self.chat_id:
+            node.stop_ptt()
+        node.store.drop_conversation(self.chat_id)
 
     def _send(self, text: str) -> None:
         node = self.app.node  # type: ignore[attr-defined]
@@ -600,7 +648,7 @@ class ChatScreen(_BaseScreen):
             return
         dispatch = {
             "back":     lambda _: self.app.pop_screen(),
-            "clear":    lambda _: self.query_one("#messages", RichLog).clear(),
+            "clear":    lambda _: self._cmd_clear(),
             "whois":    self._cmd_whois,
             "ping":     self._cmd_ping,
             "invite":   self._cmd_invite,
@@ -609,6 +657,7 @@ class ChatScreen(_BaseScreen):
             "dissolve": lambda _: self._cmd_dissolve(),
             "send":     self._cmd_send,
             "accept":   lambda _: self._cmd_accept(),
+            "cancel":   lambda _: self._cmd_cancel(),
             "reject":   lambda _: self._cmd_reject(),
         }
         fn = dispatch.get(verb)
@@ -617,6 +666,12 @@ class ChatScreen(_BaseScreen):
         else:
             self.notify(f"Comando desconhecido: /{verb}  (/help para ver a lista)",
                         severity="error")
+
+    def _cmd_clear(self) -> None:
+        node = self.app.node  # type: ignore[attr-defined]
+        node.store.clear_conversation(self.chat_id)
+        self.query_one("#messages", RichLog).clear()
+        self._last_count = 0
 
     def _cmd_whois(self, _: str) -> None:
         from wordlist import pub_to_words
@@ -711,6 +766,15 @@ class ChatScreen(_BaseScreen):
             return
         self.run_worker(node.send_file(self.chat_id, path))
 
+    def _cmd_cancel(self) -> None:
+        node  = self.app.node  # type: ignore[attr-defined]
+        offer = node._incoming_offers.pop(self.chat_id, None)
+        if not offer:
+            self.notify("Nenhuma transferência em andamento.", severity="warning")
+            return
+        offer.abort()
+        self._sys("[yellow]Transferência cancelada.[/yellow]")
+
     def _cmd_accept(self) -> None:
         node = self.app.node  # type: ignore[attr-defined]
         if self.chat_id not in node._incoming_offers:
@@ -724,6 +788,30 @@ class ChatScreen(_BaseScreen):
             self.notify("Nenhuma oferta pendente.", severity="warning")
             return
         node.reject_file(self.chat_id)
+
+    def action_ptt_toggle(self) -> None:
+        node = self.app.node  # type: ignore[attr-defined]
+        if node.ptt_active:
+            node.stop_ptt()
+        else:
+            if not node.start_ptt(self.chat_id):
+                self.notify("Sem dispositivo de áudio disponível.", severity="error")
+
+    def _update_voice_bar(self) -> None:
+        node = self.app.node  # type: ignore[attr-defined]
+        bar  = self.query_one("#voice-bar", Static)
+        if node.ptt_active and node._ptt_conv == self.chat_id:
+            bar.update("[bold red]● TX  (Ctrl+T para parar)[/bold red]")
+            bar.display = True
+        elif node._speakers.get(self.chat_id):
+            pk   = node._speakers[self.chat_id]
+            peer = node.registry.get(pk)
+            name = peer.username if peer else "peer"
+            bar.update(f"[bold yellow]🔊 {name} transmitindo[/bold yellow]")
+            bar.display = True
+        else:
+            bar.update("")
+            bar.display = False
 
     def _cmd_dissolve(self) -> None:
         node = self.app.node  # type: ignore[attr-defined]
@@ -804,6 +892,19 @@ class TeamFlowApp(App):
             old = data["old_username"]
             new = data["new_username"]
             self.notify(f"{old} alterou o nome para {new}.", title="Rename", timeout=8)
+        elif event == "peers_changed":
+            current = self.screen
+            if hasattr(current, "_poll"):
+                current._poll()
+        elif event == "group_dissolved":
+            current = self.screen
+            if hasattr(current, "chat_id") and current.chat_id == data:
+                self.notify("Grupo dissolvido pelo admin.", severity="warning", timeout=6)
+                self.pop_screen()
+        elif event in ("voice_start", "voice_end", "ptt_started", "ptt_stopped"):
+            current = self.screen
+            if hasattr(current, "_update_voice_bar"):
+                current._update_voice_bar()
 
     def _check_tofu(self) -> None:
         for h, alert in list(self.node.tofu_alerts.items()):

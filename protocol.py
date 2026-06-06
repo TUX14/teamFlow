@@ -20,6 +20,9 @@ Tipos:
   file_chunk    — chunk de arquivo (base64)
   file_accept   — receptor aceita a oferta
   file_reject   — receptor recusa a oferta
+  voice_start   — início de transmissão PTT
+  voice_frame   — chunk de áudio PCM 16 kHz mono int16 (base64, 20 ms)
+  voice_end     — fim de transmissão PTT
 """
 
 import time
@@ -111,3 +114,15 @@ def make_file_accept(file_id: str) -> dict:
 
 def make_file_reject(file_id: str) -> dict:
     return {"type": "file_reject", "file_id": file_id}
+
+
+def make_voice_start(conv_id: str, sender_hash: str) -> dict:
+    return {"type": "voice_start", "conv_id": conv_id, "sender_hash": sender_hash, "ts": time.time()}
+
+
+def make_voice_frame(conv_id: str, sender_hash: str, data: str) -> dict:
+    return {"type": "voice_frame", "conv_id": conv_id, "sender_hash": sender_hash, "data": data}
+
+
+def make_voice_end(conv_id: str, sender_hash: str) -> dict:
+    return {"type": "voice_end", "conv_id": conv_id, "sender_hash": sender_hash, "ts": time.time()}

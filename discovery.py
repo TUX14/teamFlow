@@ -219,7 +219,7 @@ class Discovery:
         recv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             recv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-        except AttributeError:
+        except (AttributeError, OSError):
             pass
         recv_sock.bind(("0.0.0.0", BROADCAST_PORT))
         recv_sock.setblocking(False)

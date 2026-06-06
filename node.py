@@ -33,6 +33,7 @@ from protocol import (
     make_group_state_payload, make_join_request,
     make_leave, make_ping, make_pong,
     make_file_offer, make_file_chunk, make_file_accept, make_file_reject,
+    make_voice_start, make_voice_frame, make_voice_end,
 )
 from wordlist import pub_to_words
 
@@ -63,6 +64,12 @@ class Node:
         self._incoming_offers: dict[str, Any] = {}
         self._outgoing_transfers: dict[str, asyncio.Future] = {}
         self._start_time: float = 0.0
+
+        # PTT — push-to-talk
+        self._ptt_conv:   str | None = None   # conv_id em transmissão
+        self._ptt_engine: object     = None   # PTTEngine, lazy
+        self._player:     object     = None   # _Player, lazy
+        self._speakers:   dict[str, str] = {} # conv_id → pub_key_hash do falante
 
     # ------------------------------------------------------------------
     # Identidade — configurada pela TUI após autenticação
@@ -98,6 +105,11 @@ class Node:
         await self.discovery.start()
 
     async def stop(self) -> None:
+        if self._ptt_conv:
+            self.stop_ptt()
+        if self._player:
+            self._player.close()
+            self._player = None
         if self.discovery:
             self.discovery.stop()
         if self.server:
@@ -141,6 +153,18 @@ class Node:
 
     def _on_disconnect(self, pub_key_hash: str) -> None:
         self.registry.mark_connected(pub_key_hash, False)
+        offer = self._incoming_offers.pop(pub_key_hash, None)
+        if offer:
+            offer.abort()
+            self.store.add(pub_key_hash, _file_msg(
+                f"[red]{offer.filename}: transferência interrompida (peer desconectou)[/red]"
+            ))
+        if self._player:
+            self._player.flush(pub_key_hash)
+        stale = [cid for cid, h in self._speakers.items() if h == pub_key_hash]
+        for cid in stale:
+            self._speakers.pop(cid, None)
+            self._emit("voice_end", {"conv_id": cid, "name": ""})
         peer = self.registry.get(pub_key_hash)
         if peer and peer.online:
             self.client.connect_to(peer.ip, peer.ws_port, peer.pub_key_hash)
@@ -269,7 +293,7 @@ class Node:
         elif t == "dissolve":
             if self.groups:
                 self.groups.apply_dissolve(payload)
-            self._emit("groups_changed")
+            self._emit("group_dissolved", payload.get("group_id"))
 
         elif t == "file_offer":
             from file_transfer import IncomingOffer, human_size
@@ -297,10 +321,29 @@ class Node:
             idx = payload.get("index")
             if not isinstance(idx, int) or not (0 <= idx < offer.total_chunks):
                 return
-            offer.chunks[idx] = _b64.b64decode(payload["data"])
+            try:
+                raw = _b64.b64decode(payload["data"])
+            except Exception:
+                return  # chunk base64 inválido — ignora
+            try:
+                offer.write_chunk(idx, raw)
+            except OSError as e:
+                offer.abort()
+                self._incoming_offers.pop(peer_hash, None)
+                self.store.add(peer_hash, _file_msg(
+                    f"[red]{offer.filename}: erro de disco — {e}[/red]"
+                ))
+                return
             if offer.complete:
-                from file_transfer import save_file
-                saved = save_file(offer.filename, offer.reassemble())
+                try:
+                    saved = offer.finalize()
+                except OSError as e:
+                    offer.abort()
+                    self._incoming_offers.pop(peer_hash, None)
+                    self.store.add(peer_hash, _file_msg(
+                        f"[red]{offer.filename}: falha ao salvar — {e}[/red]"
+                    ))
+                    return
                 self._incoming_offers.pop(peer_hash)
                 self.store.add(peer_hash, _file_msg(
                     f"[green]{offer.filename} salvo em {saved}[/green]"
@@ -315,6 +358,43 @@ class Node:
             fut = self._outgoing_transfers.pop(payload["file_id"], None)
             if fut and not fut.done():
                 fut.set_result(False)
+
+        elif t == "voice_start":
+            conv_id = payload.get("conv_id", "")
+            # Valida que o remetente pertence à conversa que declara.
+            gs = self.groups.get(conv_id) if self.groups else None
+            if gs:
+                if session.pub_key_hash not in gs.member_hashes:
+                    return
+            elif conv_id != session.pub_key_hash:
+                return
+            self._speakers[conv_id] = session.pub_key_hash
+            self._emit("voice_start", {"conv_id": conv_id, "name": session.username})
+
+        elif t == "voice_frame":
+            if self._player is None:
+                try:
+                    from voice import _Player
+                    self._player = _Player()
+                except Exception:
+                    self._player = False  # sentinel: sem saída de áudio, não tenta mais
+            if not self._player:
+                return
+            self._player.feed(session.pub_key_hash, payload.get("data", ""))
+
+        elif t == "voice_end":
+            conv_id = payload.get("conv_id", "")
+            # Mesma validação de conv_id.
+            gs = self.groups.get(conv_id) if self.groups else None
+            if gs:
+                if session.pub_key_hash not in gs.member_hashes:
+                    return
+            elif conv_id != session.pub_key_hash:
+                return
+            if self._player:
+                self._player.flush(session.pub_key_hash)
+            self._speakers.pop(conv_id, None)
+            self._emit("voice_end", {"conv_id": conv_id, "name": session.username})
 
         elif t == "ping":
             self._send(session.pub_key_hash, make_pong(payload["uuid"]))
@@ -410,9 +490,12 @@ class Node:
 
     async def send_file(self, peer_hash: str, path: Path) -> None:
         from file_transfer import iter_chunks, chunk_count, human_size, OFFER_TIMEOUT, SEND_WINDOW
+        size = path.stat().st_size
+        if size == 0:
+            self.store.add(peer_hash, _file_msg(f"[red]{path.name}: arquivo vazio, envio não suportado.[/red]"))
+            return
         total   = chunk_count(path)   # calcula sem ler o arquivo
         file_id = _uuid.uuid4().hex[:12]
-        size    = path.stat().st_size
 
         self.store.add(peer_hash, _file_msg(
             f"Enviando [bold]{path.name}[/bold] ({human_size(size)})…"
@@ -447,6 +530,14 @@ class Node:
         offer = self._incoming_offers.get(peer_hash)
         if not offer:
             return
+        try:
+            offer.open_tmp()
+        except OSError as e:
+            self._incoming_offers.pop(peer_hash, None)
+            self.store.add(peer_hash, _file_msg(
+                f"[red]{offer.filename}: não foi possível criar arquivo temporário — {e}[/red]"
+            ))
+            return
         self._send(peer_hash, make_file_accept(offer.file_id))
         self.store.add(peer_hash, _file_msg(f"Recebendo [bold]{offer.filename}[/bold]…"))
 
@@ -454,6 +545,7 @@ class Node:
         offer = self._incoming_offers.pop(peer_hash, None)
         if not offer:
             return
+        offer.abort()
         self._send(peer_hash, make_file_reject(offer.file_id))
         self.store.add(peer_hash, _file_msg(f"[yellow]{offer.filename} recusado[/yellow]"))
 
@@ -469,6 +561,59 @@ class Node:
         self._pending_pings[uid] = (now, fut)
         self._send(peer_hash, make_ping(uid))
         return fut
+
+    # ------------------------------------------------------------------
+    # PTT — push-to-talk
+    # ------------------------------------------------------------------
+
+    @property
+    def ptt_active(self) -> bool:
+        return self._ptt_conv is not None
+
+    def start_ptt(self, conv_id: str) -> bool:
+        """Inicia transmissão PTT. Retorna False se não for possível abrir o microfone."""
+        if self._ptt_conv:
+            return False
+        try:
+            from voice import PTTEngine
+            if self._ptt_engine is None:
+                self._ptt_engine = PTTEngine(self._on_ptt_frame)
+            self._ptt_engine.start(asyncio.get_running_loop())
+        except Exception:
+            return False
+        self._ptt_conv = conv_id
+        self._send_voice_to_conv(conv_id, make_voice_start(conv_id, self.identity.pub_key_hash))
+        self._emit("ptt_started", conv_id)
+        return True
+
+    def stop_ptt(self) -> None:
+        conv_id = self._ptt_conv
+        if not conv_id:
+            return
+        self._ptt_conv = None
+        if self._ptt_engine:
+            self._ptt_engine.stop()
+        self._send_voice_to_conv(conv_id, make_voice_end(conv_id, self.identity.pub_key_hash))
+        self._emit("ptt_stopped", conv_id)
+
+    def _on_ptt_frame(self, b64: str) -> None:
+        conv_id = self._ptt_conv
+        if not conv_id:
+            return
+        self._send_voice_to_conv(
+            conv_id, make_voice_frame(conv_id, self.identity.pub_key_hash, b64)
+        )
+
+    def _send_voice_to_conv(self, conv_id: str, payload: dict) -> None:
+        """Fan-out para todos os membros de grupo ou envio direto para DM."""
+        gs = self.groups.get(conv_id) if self.groups else None
+        if gs:
+            my_hex = self.identity.pub_key_bytes.hex()
+            for member in gs.members:
+                if member.pub_key_hex != my_hex:
+                    self._send(self._hash_of(member.pub_key_hex), payload)
+        else:
+            self._send(conv_id, payload)
 
     def kick_member(self, group_id: str, username: str) -> bool:
         gs = self.groups.get(group_id) if self.groups else None
